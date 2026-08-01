@@ -16,5 +16,7 @@ pipeline.log
 *.session
 basketball.db
 result.json
-pipeline.log
-.venv
+
+# Environment and system files
+.env
+.DS_Store
