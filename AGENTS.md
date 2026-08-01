@@ -1,47 +1,175 @@
-# Basket — AI-агрегатор баскетбольных турниров
+# AGENTS.md — Внутренняя документация проекта
 
-## Описание проекта
-Парсит Telegram-каналы, ищет среди постов анонсы открытых баскетбольных турниров через локальную LLM (Ollama), и публикует отобранные в свой канал.
+> Техническая документация для разработки. Для пользовательской документации см. README.md
+
+## Оглавление
+
+- [Архитектура](#архитектура)
+- [Пайплайн обработки](#пайплайн-обработки)
+- [AI-промпты](#ai-промпты)
+- [Конфигурация](#конфигурация)
+- [База данных](#база-данных)
+- [Тестирование](#тестирование)
+- [История изменений](#история-изменений)
+
+---
 
 ## Архитектура
-- `main.py` — точка входа: инициализация БД → Pipeline
-- `app/services/pipeline.py` — оркестратор: парсинг → AI-анализ → публикация
-- `app/parsers/telegram_parser.py` — парсинг Telegram-каналов (user_session)
-- `app/parsers/vk_parser.py` — парсинг VK-групп через VK API (service token)
-- `app/ai/client.py` — 3 отдельных LLM-запроса (accept → rewrite → duplicate)
-- `app/publisher/telegram_publisher.py` — публикация в канал (бот)
-- `app/database/repository.py` — CRUD для SQLite
-- `app/database/models.py` — модель Post (source, external_id, text, rewritten_text, category, importance, processed, published)
-- `app/config.py` — конфиги из .env
 
-## Пайплайн обработки поста
+### Компоненты системы
+
 ```
-Post
+main.py
   ↓
-Keywords (Python) — быстрый pre-filter
-  ↓
-Accept? (LLM, 10 токенов) — автор сам организует турнир?
-  ↓
-Rewrite (LLM, 120 токенов) — короткий анонс в формате эталона
-  ↓
-Duplicate (LLM, 10 токенов) — сверка с последними 20 постами
-  ↓
-Publish
+Pipeline (app/services/pipeline.py)
+  ├─→ TelegramParser (app/parsers/telegram_parser.py)
+  ├─→ VKParser (app/parsers/vk_parser.py)
+  ├─→ AIClient (app/ai/client.py)
+  ├─→ Repository (app/database/repository.py)
+  └─→ TelegramPublisher (app/publisher/telegram_publisher.py)
 ```
-Всего **3 вызова LLM** на пост. Конкурентность: Semaphore(3).
 
-## Промпты (app/ai/client.py)
+### Поток данных
 
-### ACCEPT_PROMPT
-- YES: автор сам проводит турнир, открывает регистрацию, собирает заявки
-- NO: автор едет/участвует в чужом турнире, играет матч, публикует результаты
-- Ключевой признак NO: "едем в / выезжаем в / отправляемся на + город"
-- "Если есть хоть малейшее сомнение — NO"
-
-### REWRITE_PROMPT
-Few-shot с эталоном. Формат вывода:
 ```
-🏀 Заголовок
+1. Парсинг
+   ├─ Telegram (Telethon) → user_session.session
+   └─ VK (vk_api) → service token
+
+2. Сохранение в БД
+   Post(source, external_id, text, processed=False)
+
+3. AI-анализ (параллельно, Semaphore(3))
+   ├─ Keywords filter (Python) — быстрый pre-filter
+   ├─ Accept? (LLM) — организатор или участник?
+   ├─ Rewrite (LLM) — форматирование
+   └─ Duplicate? (LLM) — сравнение с историей
+
+4. Обновление БД
+   Post(rewritten_text, category, importance, processed=True)
+
+5. Публикация
+   TelegramPublisher → bot_session.session → @target_channel
+```
+
+---
+
+## Пайплайн обработки
+
+### Pipeline.run()
+
+```python
+async def run(self):
+    if RESET_DB:
+        self.repo.reset_db()  # Очистка БД (dev mode)
+    else:
+        self.repo.reset_analysis()  # Сброс только processed=False
+    
+    await self._cycle()
+```
+
+### Pipeline._cycle()
+
+```python
+async def _cycle(self):
+    await self._parse_all()      # Парсинг всех источников
+    await self._process_posts()  # AI-анализ новых постов
+    await self._publish_scheduled()  # Публикация по расписанию
+```
+
+### Парсинг источников
+
+**Telegram** (лимит 500 постов):
+```python
+await self.parser.parse_channel(channel, limit=500)
+```
+
+**VK** (лимит 200 постов):
+```python
+await self.vk_parser.parse_groups(limit=200)
+```
+
+### AI-анализ
+
+Конкурентность через `asyncio.Semaphore(3)`:
+
+```python
+sem = asyncio.Semaphore(3)
+async def process(post):
+    async with sem:
+        return post, await self.ai.analyze(post.text, history)
+
+results = await asyncio.gather(*[process(p) for p in posts])
+```
+
+### Публикация
+
+Условия публикации:
+- `PUBLISH_START_HOUR <= current_hour < PUBLISH_END_HOUR`
+- Прошло `>= PUBLISH_INTERVAL_MINUTES` с последней публикации
+- Есть посты с `category == "match_announce"` и `published == False`
+
+---
+
+## AI-промпты
+
+### 1. Keywords Filter (Python)
+
+**Файл:** `app/ai/client.py:has_basketball_keywords()`
+
+Быстрый pre-filter перед LLM:
+
+```python
+BASKETBALL_KEYWORDS = [
+    "баскет", "basket", "турнир", "tournament",
+    "3х3", "3x3", "стритбол", "streetball",
+    ...
+]
+```
+
+Если ни одного ключевого слова нет → пропуск без LLM-запроса.
+
+### 2. ACCEPT_PROMPT
+
+**Цель:** Отсеять посты, где автор не организует турнир.
+
+**Выход:** `YES` или `NO` (10 токенов max)
+
+**Логика:**
+- `YES` — автор **сам организует** турнир, открывает регистрацию, собирает заявки
+- `NO` — автор едет на чужой турнир / играет матч / публикует результаты
+
+**Железные правила NO:**
+- "едем в / выезжаем в / отправляемся на + город" → `NO`
+- "результаты матча" → `NO`
+- "собираем команду на турнир [чужой]" → `NO`
+
+**Промпт:**
+```
+Определи: автор ОРГАНИЗУЕТ турнир (сам проводит, открывает регистрацию) 
+или УЧАСТВУЕТ (едет в другой город, играет в чужом турнире)?
+
+ОРГАНИЗУЕТ → YES
+УЧАСТВУЕТ → NO
+
+Если есть малейшее сомнение → NO.
+
+[POST]
+{text}
+[/POST]
+
+Ответ (YES/NO):
+```
+
+### 3. REWRITE_PROMPT
+
+**Цель:** Форматировать анонс в единый стиль (few-shot).
+
+**Выход:** 120 токенов max
+
+**Формат эталона:**
+```
+🏀 Заголовок турнира
 
 📅 дата | ⏰ время | 📍 место
 
@@ -49,116 +177,294 @@ Few-shot с эталоном. Формат вывода:
 
 📆 До дедлайна
 ```
-Максимум 4 строки. Списки длиннее 3 пунктов — удалять целиком.
 
-### DUPLICATE_PROMPT
-Сравнение с историей из 20 последних rewritten_texts.
+**Правила:**
+- Максимум 4 строки (без учёта эмодзи-строк)
+- Списки >3 пунктов → удалить целиком
+- Формат даты: `12 августа` (без года)
+- Разделитель: ` | ` (пробелы вокруг)
 
-## Модель
-- `qwen2.5:7b` (Q4_K_M, 7.6B)
-- Apple M2 Metal GPU
-- ~15-25 сек на пост (3 запроса: 2×10 токенов + 1×120 токенов)
+**Эталонный пример (пост 2405):**
+```
+🏀 Благотворительный турнир 3х3 от Grizzly
 
-## Текущее состояние (20.07.2026)
-- Парсинг: Telegram через Telethon (user_session) + VK через VK API (token)
-- AI-анализ: 3 простых промпта (NO JSON), `num_predict=120` для rewrite
-- Публикация: только `match_announce`, 24/7, без фильтра по часам
-- `RESET_DB = True` — БД чистится при каждом запуске
-- Тесты на result.json: **19/19 правильных** (9 GOOD → ACCEPT, 10 BAD → REJECT)
+📅 12 июля | ⏰ 12:00 | 📍 Московский пр., 202
 
-## Что было сделано
+📝 Заявки: @Vladislav_Sharapa
 
-### 20.07 — Полный рефакторинг AI-клиента
-- Убран JSON из ответа модели — 3 отдельных простых промпта
-- ACCEPT_PROMPT объединил classify + organizer (минус 1 вызов)
-- REWRITE_PROMPT: few-shot с эталоном (пост 2405), формат через `|`, макс 4 строки
-- `num_predict` для rewrite: 256 → 120 (нечем разгоняться)
-- Duplicate: history[-3:] → history[-20:] (ловим повторы)
-- `prompts.py` удалён (промпты inline)
-- Все промпты generic — нет упоминаний Grizzly
-- Добавлено железное правило reject: "едет/выезжает в другой город = PARTICIPANT"
-- Тесты 19/19: 9 GOOD → ACCEPT, 10 BAD → REJECT
-- Результаты тестов сохранены в `tmp/`
+📆 До 10 июля 23:59
+```
 
-### Ранее
-- Создан AGENTS.md, файловое логирование, конкурентные AI-запросы (Semaphore 3)
-- Pre-filter по ключевым словам баскетбола
-- Публикация всех принятых `match_announce`, не только первого
-- Сброс старых анализов при старте (reset_analysis)
+**Промпт:**
+```
+Перепиши анонс турнира в короткий формат (max 4 строки):
 
-### 31.07 — VK парсинг
+[ЭТАЛОН]
+{эталонный пост 2405}
+[/ЭТАЛОН]
+
+[POST]
+{text}
+[/POST]
+
+Переписанный анонс:
+```
+
+### 4. DUPLICATE_PROMPT
+
+**Цель:** Сравнить с последними 20 опубликованными постами.
+
+**Выход:** `YES` (дубликат) или `NO` (уникальный)
+
+**История:** последние 20 `rewritten_text` из БД
+
+**Промпт:**
+```
+Это дубликат одного из постов в истории?
+
+[ИСТОРИЯ]
+{history[-20:]}
+[/ИСТОРИЯ]
+
+[НОВЫЙ ПОСТ]
+{rewritten_text}
+[/НОВЫЙ ПОСТ]
+
+Дубликат? (YES/NO):
+```
+
+---
+
+## Конфигурация
+
+### .env
+
+```env
+# Telegram API (https://my.telegram.org)
+API_ID=12345678
+API_HASH=abcdef1234567890abcdef1234567890
+BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrSTUvwxYZ
+
+# Источники для парсинга
+CHANNEL_IDS=@channel1,@channel2,@channel3
+MY_CHANNEL_ID=@output_channel
+
+# VK API (https://dev.vk.ru)
+VK_APP_ID=12345678
+VK_TOKEN=service_token_from_vk_app_settings
+VK_GROUP_IDS=groupname1,groupname2
+
+# Публикация
+PUBLISH_START_HOUR=9    # с 9:00
+PUBLISH_END_HOUR=21     # до 21:00
+PUBLISH_INTERVAL_MINUTES=60  # раз в час
+
+# Dev mode
+RESET_DB=True  # False для продакшена
+```
+
+### app/config.py
+
+Читает `.env` и преобразует в переменные:
+
+```python
+CHANNEL_IDS = os.getenv("CHANNEL_IDS", "").split(",")
+VK_GROUP_IDS = os.getenv("VK_GROUP_IDS", "").split(",")
+PUBLISH_START_HOUR = int(os.getenv("PUBLISH_START_HOUR", "9"))
+RESET_DB = os.getenv("RESET_DB", "False").lower() == "true"
+```
+
+---
+
+## База данных
+
+### Модель Post (app/database/models.py)
+
+```python
+class Post(Base):
+    __tablename__ = "posts"
+    
+    id: int (PK)
+    source: str               # "telegram" | "vk"
+    external_id: str          # message.id | "owner_id_post_id"
+    text: str                 # Оригинальный текст
+    rewritten_text: str       # После AI rewrite
+    category: str             # "match_announce" | "other"
+    importance: int           # 1-10 (не используется пока)
+    processed: bool           # False → AI ещё не обработал
+    published: bool           # False → ещё не опубликован
+    created_at: datetime
+```
+
+### Repository (app/database/repository.py)
+
+**Основные методы:**
+
+```python
+def add_post(source, external_id, text):
+    # Дедупликация по (source, external_id)
+    # processed=False, published=False
+
+def get_unprocessed_posts(limit=50):
+    # WHERE processed=False ORDER BY created_at LIMIT {limit}
+
+def save_analysis(post, rewritten, category, importance):
+    # UPDATE: rewritten_text, category, importance, processed=True
+
+def mark_skipped(post):
+    # UPDATE: category="other", processed=True
+
+def mark_duplicate(post):
+    # UPDATE: processed=True
+
+def get_ready_posts():
+    # WHERE processed=True AND published=False AND category != "other"
+
+def mark_published(post):
+    # UPDATE: published=True
+
+def get_all_rewritten_texts():
+    # SELECT rewritten_text WHERE processed=True AND rewritten_text IS NOT NULL
+    # ORDER BY created_at DESC
+    # Для duplicate check
+
+def reset_db():
+    # DROP ALL + CREATE ALL (dev mode)
+
+def reset_analysis():
+    # UPDATE posts SET processed=False WHERE published=False
+```
+
+---
+
+## Тестирование
+
+### Telegram посты (result.json)
+
+**Источник:** Экспорт 2313 сообщений из @grizzlylivespb
+
+**Тесты (19 постов):**
+- ✅ **9 GOOD → ACCEPT** (организует турнир)
+- ✅ **10 BAD → REJECT** (участвует / результаты)
+
+**Эталоны:**
+
+| ID | Тип | Описание |
+|----|-----|----------|
+| 2405 | GOOD | Эталон для REWRITE_PROMPT |
+| 498, 522, 530, 531 | GOOD | Благотворительные турниры 3х3 |
+| 1262, 1484, 1542, 2156 | GOOD | Кубки Grizzly, Girls Battle |
+| 2388, 2394, 698, 1419, 1841 | BAD | "едем в Петрозаводск/Мончегорск" |
+| 2408 | BAD | Анонс матча команды |
+| 2478 | BAD | Собирает команду на чужой турнир |
+| 2476 | BAD | Пост-релиз прошедшего турнира |
+| 2358 | BAD | "Клубный турнир" (тренировка) |
+
+### VK посты (bkgrizzlyspb)
+
+**Утилиты:**
+- `tmp/fetch_vk_posts.py` — парсит N последних постов из VK группы
+- `tmp/vk_test.py` — прогоняет через AI-пайплайн
+
+**Запуск:**
+```bash
+# 1. Получить реальные посты
+python tmp/fetch_vk_posts.py
+# → tmp/vk_posts_stub.json
+
+# 2. Протестировать AI
+python tmp/vk_test.py
+# → tmp/vk_summary.json
+```
+
+**Результаты (01.08.2026, 20 постов):**
+- ✅ **2 ACCEPT** (3685 — набор в команду, 3646 — благотворительный турнир)
+- ✅ **18 REJECT** (результаты, выезды, новости команды)
+
+**Эталонный пост:** [3635](https://vk.ru/wall-214726107_3635) — "организует турнир" (закреплённый)
+
+### Производительность
+
+**Железо:** Apple M2, Metal GPU  
+**Модель:** qwen2.5:7b (Q4_K_M, 7.6B параметров)  
+**Время на пост:** 15-25 сек (3 LLM-запроса)
+
+**Breakdown:**
+- ACCEPT_PROMPT: ~3-5 сек (10 токенов)
+- REWRITE_PROMPT: ~10-15 сек (120 токенов)
+- DUPLICATE_PROMPT: ~3-5 сек (10 токенов)
+
+**Конкурентность:** `Semaphore(3)` — до 3 постов параллельно
+
+---
+
+## История изменений
+
+### 2026-08-01 — README.md и рефакторинг AGENTS.md
+- Создан публичный README.md на основе AGENTS.md
+- AGENTS.md переписан как внутренняя техническая документация
+- Добавлен .env и .DS_Store в .gitignore
+- Git user обновлён: `smetanamzh` (было `Dimasta_1488`)
+
+### 2026-08-01 — Очистка проекта и VK тестирование
+- Удалены временные файлы из `tmp/`: `*_GOOD.json`, `*_BAD*.json`, `vk_test_*.json`, `client_*.py`, `*_summary.json`
+- Оставлены утилиты: `fetch_vk_posts.py`, `vk_test.py`, `vk_posts_stub.json`
+- Протестирован реальный парсинг VK группы `bkgrizzlyspb` (2/20 ACCEPT)
+- Рабочий service token: `e8b030c9...` (скрыт в .env)
+
+### 2026-07-31 — VK парсинг
 - Добавлена библиотека `vk_api` в зависимости
-- `app/parsers/vk_parser.py` — парсинг стен VK-групп через API метод `wall.get`
-- VK парсер интегрирован в Pipeline (`_parse_all`), работает параллельно с Telegram
-- Конфиг: `VK_APP_ID=54702541`, `VK_TOKEN` (service token из настроек VK-приложения), `VK_GROUP_IDS=bkgrizzlyspb` в `.env`
-- VK посты сохраняются с `source="vk"`, `external_id` = `owner_id_post_id`
-- Поддержка пагинации: до 100 постов за запрос, `offset`-based, лимит 200 по умолчанию
-- Поддержка разных форматов ID группы: short name (`bkgrizzlyspb`), `club123456`, `-123456`, `123456`
-- Удалён `scripts/vk_auth.py` — service token не требует авторизации через логин/пароль
+- `app/parsers/vk_parser.py` — парсинг VK-групп через `wall.get`
+- Интеграция в Pipeline: параллельно с Telegram
+- Конфиг: `VK_APP_ID`, `VK_TOKEN` (service token), `VK_GROUP_IDS`
+- Поддержка форматов ID: short name (`bkgrizzlyspb`), `club123456`, `-123456`, `123456`
+- Пагинация: до 100 постов за запрос, offset-based, лимит 200
+- Удалён `scripts/vk_auth.py` (service token не требует логина)
 
-### 01.08 — Очистка проекта и тестирование VK
-- Удалены все временные файлы из `tmp/`: `*_GOOD.json`, `*_BAD*.json`, `vk_test_*.json`, `client_*.py`, `*_summary.json`
-- Оставлены только утилиты: `tmp/fetch_vk_posts.py`, `tmp/vk_test.py`, `tmp/vk_posts_stub.json`
-- Протестирован реальный парсинг группы `bkgrizzlyspb` с рабочим service token
-- Структура проекта симметрична: Telegram (parser + publisher), VK (parser)
+### 2026-07-20 — Рефакторинг AI-клиента
+- Убран JSON из ответа модели → 3 отдельных простых промпта
+- ACCEPT_PROMPT объединил classify + organizer (было 4 вызова → стало 3)
+- REWRITE_PROMPT: few-shot с эталоном (пост 2405), формат через `|`, макс 4 строки
+- `num_predict` для rewrite: 256 → 120
+- Duplicate check: history[-3:] → history[-20:]
+- Удалён `prompts.py` (промпты inline в client.py)
+- Все промпты generic (без упоминаний Grizzly)
+- Железное правило reject: "едет/выезжает в другой город" → NO
+- Тесты: **19/19 правильных** (9 GOOD, 10 BAD)
 
-## result.json
-Экспорт чата с Telegram (@grizzlylivespb). 2313 сообщений.
+### Ранее (до 2026-07-20)
+- Создан AGENTS.md, файловое логирование
+- Конкурентные AI-запросы (Semaphore 3)
+- Pre-filter по ключевым словам баскетбола
+- Публикация всех принятых `match_announce` (не только первого)
+- Сброс старых анализов при старте (`reset_analysis`)
 
-**GOOD (организует, принимать):**
-- 498 — благотворительный турнир 3х3, Grizzly проводит
-- 522 — благотворительный турнир 3х3, Grizzly проводит
-- 530 — "МЫ ОРГАНИЗУЕМ" женский турнир 1х1
-- 531 — Grizzly организовывает первый женский турнир 1х1
-- 1262 — Кубок Grizzly 3x3, приглашают команды
-- 1484 — Girls Battle 1x1, Grizzly организовывает
-- 1542 — благотворительный турнир 3х3
-- 2156 — Кубок Grizzly 3х3, женский
-- 2405 — **эталон**: Grizzly организует благотворительный турнир, заявки @Vladislav_Sharapa
+---
 
-**BAD (участвует, отклонять):**
-- 2388/2394 — Кубок Дружбы, "едет в Петрозаводск"
-- 698/2102/1419 — "выезжаем/едем в Петрозаводск"
-- 2408 — анонс матча команды Grizzly vs Валькирия
-- 2478 — собирает команду на чужой турнир "Аквамарин"
-- 2476 — пост-релиз прошедшего турнира
-- 2358 — "последняя тренировка, устроили клубный турнир"
-- 1841 — "едем в Мончегорск"
+## Roadmap
 
-## Тестирование VK постов
+### TODO
+- [ ] Добавить фильтр даты в ACCEPT_PROMPT ("турнир в прошлом" → NO)
+- [ ] Логирование AI-решений (почему ACCEPT/REJECT)
+- [ ] Мониторинг ошибок VK API (rate limits, invalid token)
+- [ ] Web-интерфейс для ручного одобрения постов (модерация)
+- [ ] Поддержка Instagram парсинга (если появится API)
+- [ ] Telegram-бот для управления (старт/стоп, статистика)
 
-### tmp/fetch_vk_posts.py
-Получает реальные посты из VK группы и сохраняет в `tmp/vk_posts_stub.json`.
+### Потенциальные улучшения
+- Переход на streaming LLM API (быстрее для rewrite)
+- Кеширование AI-результатов (если пост повторяется)
+- A/B тесты промптов (сравнение точности)
+- Fine-tuning модели на баскетбольных анонсах
+- Поддержка multi-языковых постов (English, Русский)
 
-**Запуск:**
-```bash
-.venv/bin/python tmp/fetch_vk_posts.py
-```
+---
 
-### tmp/vk_test.py
-Быстрый тест AI-пайплайна (accept → rewrite → duplicate) на VK постах.
+## Контакты
 
-**Запуск:**
-```bash
-.venv/bin/python tmp/vk_test.py
-```
+**Разработчик:** [smetanamzh](https://github.com/smetanamzh)  
+**Репозиторий:** https://github.com/smetanamzh/avi
 
-**Источник постов:**
-1. Если существует `tmp/vk_posts_stub.json` — читается оттуда (формат VK API `wall.get` response).
-2. Иначе используются 4 stub-поста (2 GOOD, 2 BAD) из `_default_stub()` в скрипте.
+---
 
-### Результаты тестов (01.08.2026)
-- Протестировано 20 реальных постов из `bkgrizzlyspb`
-- **2 ACCEPT, 18 REJECT**
-- Service token работает корректно (`e8b030c9...`)
-- Эталонный пост 3635 ("организует турнир") присутствует в `vk_posts_stub.json` (закреплённый)
-
-## Важные замечания
-- Канал-источник: @grizzlylivespb
-- Канал-приёмник: @govnomp2170
-- Модель: qwen2.5:7b
-- База: SQLite (basketball.db), чистится при каждом запуске (RESET_DB=True)
-- Сессии: user_session.session (Telegram парсинг), bot_session.session (Telegram публикация)
-- VK токен: service token из настроек VK-приложения → `VK_TOKEN` в `.env`
-- VK группы: `VK_GROUP_IDS` в `.env` (short name, clubID, или -ID)
-- Предложка: @govnobasket
+*Последнее обновление: 2026-08-01*
