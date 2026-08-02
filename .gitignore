@@ -15,6 +15,9 @@ pipeline.log
 # Sessions and runtime
 *.session
 basketball.db
+
+# Temporary test files
+tmp/*.json
 result.json
 
 # Environment and system files
