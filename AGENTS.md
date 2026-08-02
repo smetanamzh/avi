@@ -10,7 +10,7 @@
 - [Конфигурация](#конфигурация)
 - [База данных](#база-данных)
 - [Тестирование](#тестирование)
-- [История изменений](#история-изменений)
+
 
 ---
 
@@ -395,51 +395,6 @@ python tmp/vk_test.py
 - DUPLICATE_PROMPT: ~3-5 сек (10 токенов)
 
 **Конкурентность:** `Semaphore(3)` — до 3 постов параллельно
-
----
-
-## История изменений
-
-### 2026-08-01 — README.md и рефакторинг AGENTS.md
-- Создан публичный README.md на основе AGENTS.md
-- AGENTS.md переписан как внутренняя техническая документация
-- Добавлен .env и .DS_Store в .gitignore
-- Git user обновлён: `smetanamzh` (было `Dimasta_1488`)
-
-### 2026-08-01 — Очистка проекта и VK тестирование
-- Удалены временные файлы из `tmp/`: `*_GOOD.json`, `*_BAD*.json`, `vk_test_*.json`, `client_*.py`, `*_summary.json`
-- Оставлены утилиты: `fetch_vk_posts.py`, `vk_test.py`, `vk_posts_stub.json`
-- Протестирован реальный парсинг VK группы `bkgrizzlyspb` (2/20 ACCEPT)
-- Рабочий service token: `e8b030c9...` (скрыт в .env)
-
-### 2026-07-31 — VK парсинг
-- Добавлена библиотека `vk_api` в зависимости
-- `app/parsers/vk_parser.py` — парсинг VK-групп через `wall.get`
-- Интеграция в Pipeline: параллельно с Telegram
-- Конфиг: `VK_APP_ID`, `VK_TOKEN` (service token), `VK_GROUP_IDS`
-- Поддержка форматов ID: short name (`bkgrizzlyspb`), `club123456`, `-123456`, `123456`
-- Пагинация: до 100 постов за запрос, offset-based, лимит 200
-- Удалён `scripts/vk_auth.py` (service token не требует логина)
-
-### 2026-07-20 — Рефакторинг AI-клиента
-- Убран JSON из ответа модели → 3 отдельных простых промпта
-- ACCEPT_PROMPT объединил classify + organizer (было 4 вызова → стало 3)
-- REWRITE_PROMPT: few-shot с эталоном (пост 2405), формат через `|`, макс 4 строки
-- `num_predict` для rewrite: 256 → 120
-- Duplicate check: history[-3:] → history[-20:]
-- Удалён `prompts.py` (промпты inline в client.py)
-- Все промпты generic (без упоминаний Grizzly)
-- Железное правило reject: "едет/выезжает в другой город" → NO
-- Тесты: **19/19 правильных** (9 GOOD, 10 BAD)
-
-### Ранее (до 2026-07-20)
-- Создан AGENTS.md, файловое логирование
-- Конкурентные AI-запросы (Semaphore 3)
-- Pre-filter по ключевым словам баскетбола
-- Публикация всех принятых `match_announce` (не только первого)
-- Сброс старых анализов при старте (`reset_analysis`)
-
----
 
 ## Roadmap
 
