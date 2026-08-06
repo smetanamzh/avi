@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import re
-from datetime import datetime
 
 from ollama import chat
 
@@ -27,43 +26,27 @@ BASKETBALL_KEYWORDS = {
     "стритбол", "корм", "приют",
 }
 
+ACCEPT_PROMPT = """
+Является ли это сообщением об организуемом самим автором спортивном мероприятии?
 
-def _get_accept_prompt() -> str:
-    """Generate ACCEPT_PROMPT with current date."""
-    today = datetime.now().strftime('%d %B %Y')
-    return f"""
-Является ли это АНОНСОМ открытого турнира для всех желающих?
-
-YES — только если автор:
-• организует ОТКРЫТЫЙ турнир (любые команды могут подать заявку)
-• принимает заявки на турнир
-• приглашает команды участвовать
+YES — автор проводит турнир, открывает регистрацию, собирает заявки, приглашает команды, организует лагерь или мастер-класс.
 
 NO — во всех остальных случаях, включая:
-• набор игроков в СВОЮ команду / клуб ("Хочешь в команду?", "заполни анкету")
-• результаты, итоги, призеры ПРОШЕДШИХ турниров ("победители", "заняли место", "призёры")
-• жеребьёвка, расписание, фото УЖЕ ИДУЩЕГО турнира
-• поездки на чужие турниры ("едем в", "отправляемся на" + город)
-• матчи своей команды против других команд ("встречаются с командой")
-• тренировки, мастер-классы, лагеря ТОЛЬКО для своих игроков
-• благодарности, поздравления, мемы, реклама, поздравления с праздниками
-• фотографии, репортажи с прошедших событий
+• автор едет/едем/выезжает/отправляется на турнир в другой город
+• автор участвует в чужом турнире
+• автор играет матч против другой команды
+• автор публикует результаты, фото, расписание своих игр
+• автор благодарит организаторов, зовёт болельщиков
+• поздравления, мемы, реклама, мотивация
 
-Ключевые признаки NO:
-• "Хочешь в команду" / "становись частью" = набор, не турнир
-• "Призеры и победители" / "итоги" / "заняли место" = результаты, не анонс
-• "Отправляемся в" / "едем в" + город = поездка, не организация
-• "Встречаются с командой" = матч команды, не турнир
+Ключевой признак NO: автор упоминает ЧУЖОЙ турнир, куда он едет или где участвует. Слова "едем в", "выезжаем в", "отправляемся на", "участвуем в" + название города = NO.
 
-YES только когда это АНОНС ОТКРЫТОГО турнира для ВСЕХ, где автор ПРИНИМАЕТ ЗАЯВКИ.
+YES только когда автор САМ принимает заявки и проводит турнир на своей площадке.
 
 Если есть хоть малейшее сомнение — NO.
 
 Ответь только YES или NO.
 """
-
-
-ACCEPT_PROMPT = _get_accept_prompt()
 
 REWRITE_PROMPT = """
 Ты редактор большого Telegram-канала.
@@ -114,18 +97,7 @@ REWRITE_PROMPT = """
 """
 
 DUPLICATE_PROMPT = """
-Это тот же самый турнир что и в истории? Сравнивай по НАЗВАНИЮ турнира и МЕСТУ проведения.
-
-Примеры ОДНОГО турнира (разные формулировки):
-• "Кубок Grizzly 3х3 31 марта" (анонс)
-• "Кубок Grizzly 3х3 — жеребьёвка" (расписание)
-• "Призеры Кубка Grizzly 3х3" (результаты)
-→ Это ОДИН турнир, ответ YES
-
-Примеры РАЗНЫХ турниров:
-• "Кубок Grizzly 3х3" в марте
-• "Кубок Grizzly 3х3" в июле
-→ Разные даты = разные турниры, ответ NO
+Ты сравниваешь новость с ранее опубликованными. Ответь YES если то же самое событие/турнир. Ответь NO если новое.
 
 История:
 {history}
@@ -133,7 +105,7 @@ DUPLICATE_PROMPT = """
 Новость:
 {text}
 
-Это тот же турнир что и в истории? Ответь только YES или NO.
+Ответь только YES или NO.
 """
 
 
@@ -160,25 +132,19 @@ class AIClient:
                 messages.append({"role": "system", "content": system})
             messages.append({"role": "user", "content": user})
 
-            start = datetime.now()
             response = await asyncio.to_thread(
                 chat,
                 model=self.model,
                 messages=messages,
                 options=options,
             )
-            elapsed = (datetime.now() - start).total_seconds()
-            raw = response["message"]["content"].strip()
-            logger.info(f"  └ LLM [{elapsed:.1f}s] ответ: {raw[:80]}")
-            return raw
+            return response["message"]["content"].strip()
         except Exception as e:
             logger.error(f"Ollama error: {e}")
             return ""
 
     async def _accept(self, text: str) -> bool:
-        prompt = _get_accept_prompt()
-        raw = await self._ask(prompt, text, num_predict=10)
-        logger.info(f"  └ ACCEPT = {raw == 'YES'} (ответ: {raw})")
+        raw = await self._ask(ACCEPT_PROMPT, text, num_predict=10)
         return raw == "YES"
 
     async def _rewrite(self, text: str) -> str:
@@ -193,7 +159,6 @@ class AIClient:
         recent = "\n---\n".join(history[-20:])
         prompt = DUPLICATE_PROMPT.format(history=recent, text=text)
         raw = await self._ask("", prompt, num_predict=10)
-        logger.info(f"  └ DUPLICATE = {raw == 'YES'} (ответ: {raw})")
         return raw == "YES"
 
     def _clean(self, text: str) -> str:
@@ -201,25 +166,23 @@ class AIClient:
         text = re.sub(r'[ \t]+', ' ', text)
         return text.strip()
 
-    def _skip(self, reason: str = "") -> dict:
+    def _skip(self) -> dict:
         return {
             "accept": False,
             "duplicate": False,
             "importance": 3,
             "category": "other",
             "rewritten_text": "",
-            "_skip_reason": reason,
         }
 
     async def analyze(self, text: str, history: list[str]) -> dict:
         text = text[:1500]
 
         if not has_basketball_keywords(text):
-            logger.info("  └ SKIP: нет баскетбольных ключевых слов")
-            return self._skip("no_keywords")
+            return self._skip()
 
         if not await self._accept(text):
-            return self._skip("accept_rejected")
+            return self._skip()
 
         rewritten = await self._rewrite(text)
 

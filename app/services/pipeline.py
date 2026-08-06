@@ -58,9 +58,12 @@ class Pipeline:
 
     async def _parse_all(self):
         logger.info("Парсим источники...")
-        for channel in CHANNEL_IDS:
-            logger.info(f"--- {channel} ---")
-            await self.parser.parse_channel(channel, limit=500)
+
+        # Telegram парсер отключён
+        logger.info("Telegram парсер отключён, пропускаем")
+        # for channel in CHANNEL_IDS:
+        #     logger.info(f"--- {channel} ---")
+        #     await self.parser.parse_channel(channel, limit=500)
 
         if VK_TOKEN and VK_GROUP_IDS:
             await self.vk_parser.parse_groups(limit=200)
@@ -85,10 +88,13 @@ class Pipeline:
         results = await asyncio.gather(*[process(p) for p in posts])
 
         for idx, (post, result) in enumerate(results, 1):
-            logger.info(f"Обрабатываем: {idx}/{len(posts)}")
+            logger.info(f"Обрабатываем: {idx}/{len(posts)} | vk:{post.id}")
+            _preview = post.text[:200].replace('\n', ' ').strip()
+            logger.info(f"  └ Текст: {_preview}...")
 
             if not result["accept"]:
-                logger.info("  └ Пропущено")
+                reason = result.get('_skip_reason', 'unknown')
+                logger.info(f"  └ SKIP ({reason})")
                 self.repo.mark_skipped(post)
                 continue
 
@@ -109,17 +115,9 @@ class Pipeline:
 
     async def _publish_scheduled(self):
         now = datetime.now()
-        current_hour = now.hour
 
-        if current_hour < PUBLISH_START_HOUR or current_hour >= PUBLISH_END_HOUR:
-            logger.info("Нерабочее время, публикация отложена")
-            return
-
-        if self._last_publish:
-            elapsed = (now - self._last_publish).total_seconds() / 60
-            if elapsed < PUBLISH_INTERVAL_MINUTES:
-                logger.debug(f"Интервал ещё не прошёл ({elapsed:.0f} / {PUBLISH_INTERVAL_MINUTES} мин)")
-                return
+        # Ограничения по времени и интервалам отключены для тестирования
+        logger.info("Публикация без ограничений (тестовый режим)")
 
         ready = self.repo.get_ready_posts()
         if not ready:
